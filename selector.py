@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from catalogue import RULES
 import patterns
 from patterns import Args, Need, Pattern, Rule, children
 
@@ -48,7 +49,7 @@ class SelectionTable:
 
 
 class Selector:
-    def __init__(self, rules: Iterable[Rule] = ()) -> None:
+    def __init__(self, rules: Iterable[Rule] = RULES) -> None:
         self.rules: tuple[Rule, ...] = tuple(rules)
 
     def analyze(self, expression: Any) -> SelectionTable:
