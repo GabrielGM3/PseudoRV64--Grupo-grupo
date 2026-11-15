@@ -30,6 +30,9 @@ from ir import (
     Mul,
     Neg,
     Param,
+    PrintBool,
+    PrintInt,
+    PrintString,
     ProgramIR,
     Rem,
     Return,
@@ -157,6 +160,46 @@ class CodeGenerator:
                 ctx.emit(Move(dst=var_reg, src=val_reg, origin=_span_of(stmt)))
             return
 
+        if kind == "IfStmt":
+            cond_expr = getattr(stmt, "condition", getattr(stmt, "cond", None))
+            then_branch = getattr(stmt, "then_block", getattr(stmt, "then_branch", getattr(stmt, "then_stmt", None)))
+            else_branch = getattr(stmt, "else_block", getattr(stmt, "else_branch", getattr(stmt, "else_stmt", None)))
+
+            then_label = ctx.label()
+            if else_branch is not None:
+                else_label = ctx.label()
+                end_label = ctx.label()
+                self._compile_expr_cond(cond_expr, ctx, then_label, else_label)
+                ctx.emit(LabelInstr(label=then_label))
+                self._generate_stmt(then_branch, ctx)
+                ctx.emit(Jump(target=end_label, origin=_span_of(stmt)))
+                ctx.emit(LabelInstr(label=else_label))
+                self._generate_stmt(else_branch, ctx)
+                ctx.emit(LabelInstr(label=end_label))
+            else:
+                end_label = ctx.label()
+                self._compile_expr_cond(cond_expr, ctx, then_label, end_label)
+                ctx.emit(LabelInstr(label=then_label))
+                self._generate_stmt(then_branch, ctx)
+                ctx.emit(LabelInstr(label=end_label))
+            return
+
+        if kind == "WhileStmt":
+            cond_expr = getattr(stmt, "condition", getattr(stmt, "cond", None))
+            body_stmt = getattr(stmt, "body", None)
+
+            test_label = ctx.label()
+            body_label = ctx.label()
+            end_label = ctx.label()
+
+            ctx.emit(LabelInstr(label=test_label))
+            self._compile_expr_cond(cond_expr, ctx, body_label, end_label)
+            ctx.emit(LabelInstr(label=body_label))
+            self._generate_stmt(body_stmt, ctx)
+            ctx.emit(Jump(target=test_label, origin=_span_of(stmt)))
+            ctx.emit(LabelInstr(label=end_label))
+            return
+
         if kind == "ReturnStmt":
             val_expr = getattr(stmt, "value", getattr(stmt, "expr", None))
             if val_expr is not None:
@@ -164,6 +207,32 @@ class CodeGenerator:
                 ctx.emit(Return(value=val_reg, origin=_span_of(stmt)))
             else:
                 ctx.emit(Return(value=None, origin=_span_of(stmt)))
+            return
+
+        if kind == "PrintStmt":
+            items = getattr(stmt, "items", getattr(stmt, "args", getattr(stmt, "expressions", [])))
+            for item in items:
+                item_kind = type(item).__name__
+                if item_kind == "StringLiteral":
+                    s_ref = ctx.string(_decode_escapes(item.value))
+                    ctx.emit(PrintString(string=s_ref, origin=_span_of(item)))
+                else:
+                    val_reg = self._compile_expr_reg(item, ctx)
+                    if type_name_of(item) == "bool":
+                        ctx.emit(PrintBool(value=val_reg, origin=_span_of(item)))
+                    else:
+                        ctx.emit(PrintInt(value=val_reg, origin=_span_of(item)))
+            newline_ref = ctx.string("\n")
+            ctx.emit(PrintString(string=newline_ref, origin=_span_of(stmt)))
+            return
+
+        if kind in ("ExprStmt", "CallStmt"):
+            expr = getattr(stmt, "expr", getattr(stmt, "expression", getattr(stmt, "call", stmt)))
+            self._compile_expr_effect(expr, ctx)
+            return
+
+        if kind == "CallExpr":
+            self._compile_expr_effect(stmt, ctx)
             return
 
         raise ValueError(f"Comando desconhecido {kind} em {_span_of(stmt)}")
