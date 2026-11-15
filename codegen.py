@@ -13,10 +13,18 @@ from catalogue import (
 from ir import (
     Add,
     Addi,
+    Beq,
+    Bge,
+    Blt,
+    Bne,
+    Bnez,
+    Call,
     Context,
     Div,
     FunctionIR,
+    Jump,
     Label,
+    LabelInstr,
     Li,
     Move,
     Mul,
@@ -25,12 +33,16 @@ from ir import (
     ProgramIR,
     Rem,
     Return,
+    Seqz,
     Slli,
+    Slt,
+    Snez,
     Sub,
     VReg,
+    Xor,
 )
 import patterns
-from patterns import REG
+from patterns import COND, EFFECT, REG
 from selector import Choice, SelectionTable, Selector
 
 
@@ -170,6 +182,22 @@ class CodeGenerator:
         choice = self._require_choice(table, expr, REG)
         return self._emit_choice(expr, choice, table, ctx)
 
+    def _compile_expr_cond(
+        self, expr: Any, ctx: Context, true_label: Label, false_label: Label
+    ) -> None:
+        table = self.selector.analyze(expr)
+        choice = self._require_choice(table, expr, COND)
+        self._emit_choice(expr, choice, table, ctx, true_label, false_label)
+
+    def _compile_expr_effect(self, expr: Any, ctx: Context) -> None:
+        table = self.selector.analyze(expr)
+        choice = table.lookup(expr, EFFECT)
+        if choice is not None:
+            self._emit_choice(expr, choice, table, ctx)
+            return
+        choice = self._require_choice(table, expr, REG)
+        self._emit_choice(expr, choice, table, ctx)
+
     def _emit_subproblem(
         self,
         sub: tuple[Any, Any],
@@ -277,3 +305,168 @@ class CodeGenerator:
         dst = ctx.temp()
         ctx.emit(Slli(dst=dst, src=src, shift=shift, origin=_span_of(node)))
         return dst
+
+    def emit_lt_reg(self, node, choice, table, ctx, true_label=None, false_label=None) -> VReg:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        dst = ctx.temp()
+        ctx.emit(Slt(dst=dst, lhs=lhs, rhs=rhs, origin=_span_of(node)))
+        return dst
+
+    def emit_gt_reg(self, node, choice, table, ctx, true_label=None, false_label=None) -> VReg:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        dst = ctx.temp()
+        ctx.emit(Slt(dst=dst, lhs=rhs, rhs=lhs, origin=_span_of(node)))
+        return dst
+
+    def emit_le_reg(self, node, choice, table, ctx, true_label=None, false_label=None) -> VReg:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        dst = ctx.temp()
+        ctx.emit(Slt(dst=dst, lhs=rhs, rhs=lhs, origin=_span_of(node)))
+        ctx.emit(Seqz(dst=dst, src=dst, origin=_span_of(node)))
+        return dst
+
+    def emit_ge_reg(self, node, choice, table, ctx, true_label=None, false_label=None) -> VReg:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        dst = ctx.temp()
+        ctx.emit(Slt(dst=dst, lhs=lhs, rhs=rhs, origin=_span_of(node)))
+        ctx.emit(Seqz(dst=dst, src=dst, origin=_span_of(node)))
+        return dst
+
+    def emit_eq_reg(self, node, choice, table, ctx, true_label=None, false_label=None) -> VReg:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        dst = ctx.temp()
+        ctx.emit(Xor(dst=dst, lhs=lhs, rhs=rhs, origin=_span_of(node)))
+        ctx.emit(Seqz(dst=dst, src=dst, origin=_span_of(node)))
+        return dst
+
+    def emit_ne_reg(self, node, choice, table, ctx, true_label=None, false_label=None) -> VReg:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        dst = ctx.temp()
+        ctx.emit(Xor(dst=dst, lhs=lhs, rhs=rhs, origin=_span_of(node)))
+        ctx.emit(Snez(dst=dst, src=dst, origin=_span_of(node)))
+        return dst
+
+    def emit_lt_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        ctx.emit(Blt(lhs=lhs, rhs=rhs, target=true_label, origin=_span_of(node)))
+        ctx.emit(Jump(target=false_label, origin=_span_of(node)))
+
+    def emit_gt_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        ctx.emit(Blt(lhs=rhs, rhs=lhs, target=true_label, origin=_span_of(node)))
+        ctx.emit(Jump(target=false_label, origin=_span_of(node)))
+
+    def emit_le_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        ctx.emit(Bge(lhs=rhs, rhs=lhs, target=true_label, origin=_span_of(node)))
+        ctx.emit(Jump(target=false_label, origin=_span_of(node)))
+
+    def emit_ge_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        ctx.emit(Bge(lhs=lhs, rhs=rhs, target=true_label, origin=_span_of(node)))
+        ctx.emit(Jump(target=false_label, origin=_span_of(node)))
+
+    def emit_eq_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        ctx.emit(Beq(lhs=lhs, rhs=rhs, target=true_label, origin=_span_of(node)))
+        ctx.emit(Jump(target=false_label, origin=_span_of(node)))
+
+    def emit_ne_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        lhs = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        rhs = self._emit_subproblem(choice.subproblems[1], table, ctx)
+        ctx.emit(Bne(lhs=lhs, rhs=rhs, target=true_label, origin=_span_of(node)))
+        ctx.emit(Jump(target=false_label, origin=_span_of(node)))
+
+    def emit_not_reg(self, node, choice, table, ctx, true_label=None, false_label=None) -> VReg:
+        src = self._emit_subproblem(choice.subproblems[0], table, ctx)
+        dst = ctx.temp()
+        ctx.emit(Seqz(dst=dst, src=src, origin=_span_of(node)))
+        return dst
+
+    def emit_not_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        self._emit_subproblem(choice.subproblems[0], table, ctx, false_label, true_label)
+
+    def emit_and_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        mid_label = ctx.label()
+        self._emit_subproblem(choice.subproblems[0], table, ctx, mid_label, false_label)
+        ctx.emit(LabelInstr(label=mid_label))
+        self._emit_subproblem(choice.subproblems[1], table, ctx, true_label, false_label)
+
+    def emit_or_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        mid_label = ctx.label()
+        self._emit_subproblem(choice.subproblems[0], table, ctx, true_label, mid_label)
+        ctx.emit(LabelInstr(label=mid_label))
+        self._emit_subproblem(choice.subproblems[1], table, ctx, true_label, false_label)
+
+    def emit_and_reg(self, node, choice, table, ctx, true_label=None, false_label=None) -> VReg:
+        mid_label = ctx.label()
+        t_label = ctx.label()
+        f_label = ctx.label()
+        end_label = ctx.label()
+        dst = ctx.temp()
+
+        self._emit_subproblem(choice.subproblems[0], table, ctx, mid_label, f_label)
+        ctx.emit(LabelInstr(label=mid_label))
+        self._emit_subproblem(choice.subproblems[1], table, ctx, t_label, f_label)
+        ctx.emit(LabelInstr(label=t_label))
+        ctx.emit(Li(dst=dst, imm=1, origin=_span_of(node)))
+        ctx.emit(Jump(target=end_label, origin=_span_of(node)))
+        ctx.emit(LabelInstr(label=f_label))
+        ctx.emit(Li(dst=dst, imm=0, origin=_span_of(node)))
+        ctx.emit(LabelInstr(label=end_label))
+        return dst
+
+    def emit_or_reg(self, node, choice, table, ctx, true_label=None, false_label=None) -> VReg:
+        mid_label = ctx.label()
+        t_label = ctx.label()
+        f_label = ctx.label()
+        end_label = ctx.label()
+        dst = ctx.temp()
+
+        self._emit_subproblem(choice.subproblems[0], table, ctx, t_label, mid_label)
+        ctx.emit(LabelInstr(label=mid_label))
+        self._emit_subproblem(choice.subproblems[1], table, ctx, t_label, f_label)
+        ctx.emit(LabelInstr(label=t_label))
+        ctx.emit(Li(dst=dst, imm=1, origin=_span_of(node)))
+        ctx.emit(Jump(target=end_label, origin=_span_of(node)))
+        ctx.emit(LabelInstr(label=f_label))
+        ctx.emit(Li(dst=dst, imm=0, origin=_span_of(node)))
+        ctx.emit(LabelInstr(label=end_label))
+        return dst
+
+    def emit_literal_bool_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        target = true_label if getattr(node, "value", False) else false_label
+        ctx.emit(Jump(target=target, origin=_span_of(node)))
+
+    def emit_ident_bool_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        vreg = ctx.variable(get_node_symbol(node))
+        ctx.emit(Bnez(src=vreg, target=true_label, origin=_span_of(node)))
+        ctx.emit(Jump(target=false_label, origin=_span_of(node)))
+
+    def emit_call_reg(self, node, choice, table, ctx, true_label=None, false_label=None) -> VReg:
+        arg_regs = [self._emit_subproblem(sub, table, ctx) for sub in choice.subproblems]
+        dst = ctx.temp()
+        ctx.emit(Call(dst=dst, function=get_node_symbol(node), args=arg_regs, origin=_span_of(node)))
+        return dst
+
+    def emit_call_effect(self, node, choice, table, ctx, true_label=None, false_label=None) -> None:
+        arg_regs = [self._emit_subproblem(sub, table, ctx) for sub in choice.subproblems]
+        ctx.emit(Call(dst=None, function=get_node_symbol(node), args=arg_regs, origin=_span_of(node)))
+
+    def emit_call_bool_cond(self, node, choice, table, ctx, true_label, false_label) -> None:
+        arg_regs = [self._emit_subproblem(sub, table, ctx) for sub in choice.subproblems]
+        dst = ctx.temp()
+        ctx.emit(Call(dst=dst, function=get_node_symbol(node), args=arg_regs, origin=_span_of(node)))
+        ctx.emit(Bnez(src=dst, target=true_label, origin=_span_of(node)))
+        ctx.emit(Jump(target=false_label, origin=_span_of(node)))
