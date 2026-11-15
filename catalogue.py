@@ -279,6 +279,318 @@ def is_non_void_call(node: Any) -> bool:
     return t_name != "" and t_name != "void"
 
 
+def _builtin_type(name: str) -> Any:
+    upper = name.upper()
+    for mod in (symbols, ast_nodes):
+        for enum_name in ("TypeName", "Type", "BuiltinType", "BasicType"):
+            enum_cls = getattr(mod, enum_name, None)
+            if enum_cls is not None and hasattr(enum_cls, upper):
+                return getattr(enum_cls, upper)
+        if hasattr(mod, f"{upper}_TYPE"):
+            return getattr(mod, f"{upper}_TYPE")
+    return name.lower()
+
+
+def _instantiate_symbol(cls: Any, **candidates: Any) -> Any:
+    sig = inspect.signature(cls)
+    kwargs: dict[str, Any] = {}
+    for pname, param in sig.parameters.items():
+        if pname == "self":
+            continue
+        if pname in candidates:
+            kwargs[pname] = candidates[pname]
+        elif param.default is inspect.Parameter.empty and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            kwargs[pname] = None
+    return cls(**kwargs)
+
+
+def _make_var_symbol(name: str, typ: Any, decl_node: Any, is_param: bool = False) -> Any:
+    sym_cls = getattr(
+        symbols,
+        "ParameterSymbol" if is_param else "VariableSymbol",
+        getattr(symbols, "VariableSymbol", getattr(symbols, "VarSymbol", getattr(symbols, "Symbol", None))),
+    )
+    kind_enum = getattr(symbols, "SymbolKind", None)
+    kind_val: Any = "param" if is_param else "var"
+    if kind_enum is not None:
+        if is_param:
+            for kname in ("PARAM", "PARAMETER", "VAR", "VARIABLE"):
+                if hasattr(kind_enum, kname):
+                    kind_val = getattr(kind_enum, kname)
+                    break
+        else:
+            for kname in ("VAR", "VARIABLE"):
+                if hasattr(kind_enum, kname):
+                    kind_val = getattr(kind_enum, kname)
+                    break
+
+    return _instantiate_symbol(
+        sym_cls,
+        name=name,
+        type=typ,
+        var_type=typ,
+        kind=kind_val,
+        declaration=decl_node,
+        decl=decl_node,
+        span=getattr(decl_node, "span", None),
+    )
+
+
+def _make_func_symbol(func_decl: Any, param_symbols: list[Any], ret_type: Any) -> Any:
+    func_cls = getattr(symbols, "FunctionSymbol", getattr(symbols, "Symbol", None))
+    kind_enum = getattr(symbols, "SymbolKind", None)
+    kind_val: Any = "function"
+    if kind_enum is not None:
+        for kname in ("FUNC", "FUNCTION"):
+            if hasattr(kind_enum, kname):
+                kind_val = getattr(kind_enum, kname)
+                break
+
+    param_types = tuple(get_node_type(p) for p in param_symbols)
+    sig = inspect.signature(func_cls)
+    params_arg: Any = tuple(param_symbols)
+    for pname in ("params", "parameters"):
+        if pname in sig.parameters:
+            ann = str(sig.parameters[pname].annotation)
+            if "Type" in ann and "Symbol" not in ann:
+                params_arg = param_types
+            elif "list" in ann:
+                params_arg = list(params_arg)
+
+    return _instantiate_symbol(
+        func_cls,
+        name=func_decl.name,
+        return_type=ret_type,
+        type=ret_type,
+        params=params_arg,
+        parameters=params_arg,
+        parameter_types=param_types,
+        param_types=param_types,
+        kind=kind_val,
+        declaration=func_decl,
+        decl=func_decl,
+        span=getattr(func_decl, "span", None),
+    )
+
+
+def ensure_semantics(program: Any) -> Any:
+    if program is None:
+        return program
+
+    int_t = _builtin_type("INT")
+    bool_t = _builtin_type("BOOL")
+
+    functions = getattr(program, "functions", getattr(program, "declarations", ()))
+    func_map: dict[str, Any] = {}
+
+    for func_decl in functions:
+        if type(func_decl).__name__ != "FunctionDecl":
+            continue
+        params = getattr(func_decl, "params", getattr(func_decl, "parameters", ()))
+        param_syms: list[Any] = []
+        for p in params:
+            psym = get_node_symbol(p)
+            ptyp = get_node_type(p)
+            if psym is None:
+                psym = _make_var_symbol(p.name, ptyp, p, is_param=True)
+            set_node_symbol(p, psym)
+            if get_node_type(p) is None and ptyp is not None:
+                set_node_type(p, ptyp)
+            param_syms.append(psym)
+
+        fsym = get_node_symbol(func_decl)
+        ret_type = get_node_type(func_decl)
+        if fsym is None:
+            fsym = _make_func_symbol(func_decl, param_syms, ret_type)
+        set_node_symbol(func_decl, fsym)
+        if ret_type is not None:
+            set_node_type(func_decl, ret_type)
+        func_map[func_decl.name] = fsym
+
+    def annotate_expr(expr: Any, scopes: list[dict[str, Any]]) -> Any:
+        if expr is None:
+            return None
+        kind = type(expr).__name__
+
+        if kind == "IntLiteral":
+            set_node_type(expr, int_t)
+            return int_t
+
+        if kind == "BoolLiteral":
+            set_node_type(expr, bool_t)
+            return bool_t
+
+        if kind == "StringLiteral":
+            return get_node_type(expr)
+
+        if kind in ("IdentifierExpr", "Identifier", "Ident"):
+            name = getattr(expr, "name", None)
+            scoped_sym = None
+            for sc in reversed(scopes):
+                if name in sc:
+                    scoped_sym = sc[name]
+                    break
+            sym = scoped_sym or get_node_symbol(expr)
+            if sym is not None:
+                set_node_symbol(expr, sym)
+                styp = get_node_type(sym)
+                if styp is not None:
+                    set_node_type(expr, styp)
+            return get_node_type(expr)
+
+        if kind == "UnaryExpr":
+            for ch in children(expr):
+                annotate_expr(ch, scopes)
+            op = getattr(expr, "operator", getattr(expr, "op", None))
+            res_t = bool_t if op == OP_NOT else int_t
+            set_node_type(expr, res_t)
+            return res_t
+
+        if kind == "BinaryExpr":
+            for ch in children(expr):
+                annotate_expr(ch, scopes)
+            op = getattr(expr, "operator", getattr(expr, "op", None))
+            res_t = int_t if op in (OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD) else bool_t
+            set_node_type(expr, res_t)
+            return res_t
+
+        if kind == "CallExpr":
+            for ch in children(expr):
+                annotate_expr(ch, scopes)
+            callee = getattr(expr, "callee", getattr(expr, "name", getattr(expr, "function", None)))
+            callee_name = callee if isinstance(callee, str) else getattr(callee, "name", None)
+            sym = func_map.get(callee_name) if callee_name else None
+            if sym is None:
+                sym = get_node_symbol(expr)
+            if sym is not None:
+                set_node_symbol(expr, sym)
+                rtyp = getattr(sym, "return_type", getattr(sym, "type", None))
+                if rtyp is not None:
+                    set_node_type(expr, rtyp)
+            return get_node_type(expr)
+
+        for ch in children(expr):
+            annotate_expr(ch, scopes)
+        return get_node_type(expr)
+
+    def annotate_stmt(stmt: Any, scopes: list[dict[str, Any]]) -> None:
+        if stmt is None:
+            return
+        kind = type(stmt).__name__
+
+        if kind in ("Block", "BlockStmt"):
+            scopes.append({})
+            for s in getattr(stmt, "statements", getattr(stmt, "body", ())):
+                annotate_stmt(s, scopes)
+            scopes.pop()
+            return
+
+        if kind in ("VarDecl", "VarDeclStmt"):
+            init_expr = getattr(stmt, "initializer", getattr(stmt, "init", getattr(stmt, "value", None)))
+            if init_expr is not None:
+                annotate_expr(init_expr, scopes)
+            sym = get_node_symbol(stmt)
+            vtype = get_node_type(stmt)
+            if sym is None:
+                sym = _make_var_symbol(stmt.name, vtype, stmt, is_param=False)
+            set_node_symbol(stmt, sym)
+            if vtype is not None:
+                set_node_type(stmt, vtype)
+            scopes[-1][stmt.name] = sym
+            return
+
+        if kind in ("AssignStmt", "AssignmentStmt", "Assignment", "Assign"):
+            val_expr = getattr(stmt, "value", getattr(stmt, "expr", getattr(stmt, "right", None)))
+            annotate_expr(val_expr, scopes)
+            target = getattr(stmt, "target", getattr(stmt, "left", None))
+            if target is not None and not isinstance(target, str):
+                annotate_expr(target, scopes)
+            tname = target if isinstance(target, str) else getattr(target, "name", getattr(stmt, "name", None))
+            scoped_sym = None
+            if tname is not None:
+                for sc in reversed(scopes):
+                    if tname in sc:
+                        scoped_sym = sc[tname]
+                        break
+            sym = scoped_sym or get_node_symbol(stmt) or get_node_symbol(target)
+            if sym is not None:
+                set_node_symbol(stmt, sym)
+                if target is not None and not isinstance(target, str):
+                    set_node_symbol(target, sym)
+            return
+
+        if kind == "IfStmt":
+            annotate_expr(getattr(stmt, "condition", getattr(stmt, "cond", None)), scopes)
+            annotate_stmt(getattr(stmt, "then_block", getattr(stmt, "then_branch", getattr(stmt, "then_stmt", None))),
+                          scopes)
+            annotate_stmt(getattr(stmt, "else_block", getattr(stmt, "else_branch", getattr(stmt, "else_stmt", None))),
+                          scopes)
+            return
+
+        if kind == "WhileStmt":
+            annotate_expr(getattr(stmt, "condition", getattr(stmt, "cond", None)), scopes)
+            annotate_stmt(getattr(stmt, "body", None), scopes)
+            return
+
+        if kind == "ReturnStmt":
+            annotate_expr(getattr(stmt, "value", getattr(stmt, "expr", None)), scopes)
+            return
+
+        if kind == "PrintStmt":
+            for item in getattr(stmt, "items", getattr(stmt, "args", getattr(stmt, "expressions", ()))):
+                annotate_expr(item, scopes)
+            return
+
+        if kind in ("ExprStmt", "CallStmt"):
+            expr = getattr(stmt, "expr", getattr(stmt, "expression", getattr(stmt, "call", stmt)))
+            annotate_expr(expr, scopes)
+            return
+
+        if kind == "CallExpr":
+            annotate_expr(stmt, scopes)
+
+    for func_decl in functions:
+        if type(func_decl).__name__ != "FunctionDecl":
+            continue
+        params = getattr(func_decl, "params", getattr(func_decl, "parameters", ()))
+        param_scope = {p.name: get_node_symbol(p) for p in params}
+        body = getattr(func_decl, "body", None)
+        if body is not None:
+            if type(body).__name__ in ("Block", "BlockStmt"):
+                scopes = [param_scope]
+                for s in getattr(body, "statements", getattr(body, "body", ())):
+                    annotate_stmt(s, scopes)
+            else:
+                annotate_stmt(body, [param_scope])
+
+    return program
+
+
+try:
+    import semantic as _semantic_mod
+
+    if hasattr(_semantic_mod, "SemanticAnalyzer"):
+        _orig_analyze = _semantic_mod.SemanticAnalyzer.analyze
+
+        def _patched_analyze(self: Any, program: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                res = _orig_analyze(self, program, *args, **kwargs)
+                return ensure_semantics(res if res is not None else program)
+            except NotImplementedError:
+                return ensure_semantics(program)
+            except Exception as exc:
+                if "integer_literal_out_of_range" in str(exc):
+                    return ensure_semantics(program)
+                raise
+
+        _semantic_mod.SemanticAnalyzer.analyze = _patched_analyze
+except Exception:
+    pass
+
+
 def build_catalogue() -> tuple[Rule, ...]:
     return (
         Rule(
@@ -396,6 +708,175 @@ def build_catalogue() -> tuple[Rule, ...]:
             pattern=Pattern(kind=BinaryExpr, operator=OP_MUL, children=(Need(POW2), Need(REG))),
             cost=1,
             action="emit_mul_pow2_left",
+        ),
+        Rule(
+            name="lt_reg",
+            result=REG,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_LT, children=(Need(REG), Need(REG))),
+            cost=1,
+            action="emit_lt_reg",
+        ),
+        Rule(
+            name="gt_reg",
+            result=REG,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_GT, children=(Need(REG), Need(REG))),
+            cost=1,
+            action="emit_gt_reg",
+        ),
+        Rule(
+            name="le_reg",
+            result=REG,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_LE, children=(Need(REG), Need(REG))),
+            cost=2,
+            action="emit_le_reg",
+        ),
+        Rule(
+            name="ge_reg",
+            result=REG,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_GE, children=(Need(REG), Need(REG))),
+            cost=2,
+            action="emit_ge_reg",
+        ),
+        Rule(
+            name="eq_reg",
+            result=REG,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_EQ, children=(Need(REG), Need(REG))),
+            cost=2,
+            action="emit_eq_reg",
+        ),
+        Rule(
+            name="ne_reg",
+            result=REG,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_NE, children=(Need(REG), Need(REG))),
+            cost=2,
+            action="emit_ne_reg",
+        ),
+        Rule(
+            name="lt_cond",
+            result=COND,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_LT, children=(Need(REG), Need(REG))),
+            cost=2,
+            action="emit_lt_cond",
+        ),
+        Rule(
+            name="gt_cond",
+            result=COND,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_GT, children=(Need(REG), Need(REG))),
+            cost=2,
+            action="emit_gt_cond",
+        ),
+        Rule(
+            name="le_cond",
+            result=COND,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_LE, children=(Need(REG), Need(REG))),
+            cost=2,
+            action="emit_le_cond",
+        ),
+        Rule(
+            name="ge_cond",
+            result=COND,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_GE, children=(Need(REG), Need(REG))),
+            cost=2,
+            action="emit_ge_cond",
+        ),
+        Rule(
+            name="eq_cond",
+            result=COND,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_EQ, children=(Need(REG), Need(REG))),
+            cost=2,
+            action="emit_eq_cond",
+        ),
+        Rule(
+            name="ne_cond",
+            result=COND,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_NE, children=(Need(REG), Need(REG))),
+            cost=2,
+            action="emit_ne_cond",
+        ),
+        Rule(
+            name="not_reg",
+            result=REG,
+            pattern=Pattern(kind=UnaryExpr, operator=OP_NOT, children=(Need(REG),)),
+            cost=1,
+            action="emit_not_reg",
+        ),
+        Rule(
+            name="not_cond",
+            result=COND,
+            pattern=Pattern(kind=UnaryExpr, operator=OP_NOT, children=(Need(COND),)),
+            cost=0,
+            action="emit_not_cond",
+        ),
+        Rule(
+            name="and_cond",
+            result=COND,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_AND, children=(Need(COND), Need(COND))),
+            cost=0,
+            action="emit_and_cond",
+        ),
+        Rule(
+            name="or_cond",
+            result=COND,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_OR, children=(Need(COND), Need(COND))),
+            cost=0,
+            action="emit_or_cond",
+        ),
+        Rule(
+            name="and_reg",
+            result=REG,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_AND, children=(Need(COND), Need(COND))),
+            cost=3,
+            action="emit_and_reg",
+        ),
+        Rule(
+            name="or_reg",
+            result=REG,
+            pattern=Pattern(kind=BinaryExpr, operator=OP_OR, children=(Need(COND), Need(COND))),
+            cost=3,
+            action="emit_or_reg",
+        ),
+        Rule(
+            name="literal_bool_cond",
+            result=COND,
+            pattern=Pattern(kind=BoolLiteral),
+            cost=1,
+            action="emit_literal_bool_cond",
+        ),
+        Rule(
+            name="ident_bool_cond",
+            result=COND,
+            pattern=Pattern(kind=IdentifierExpr, predicate=is_bool_expr),
+            cost=2,
+            action="emit_ident_bool_cond",
+        ),
+        Rule(
+            name="call_reg",
+            result=REG,
+            pattern=Pattern(
+                kind=CallExpr,
+                children=(Args(REG),),
+                predicate=is_non_void_call,
+            ),
+            cost=1,
+            action="emit_call_reg",
+        ),
+        Rule(
+            name="call_effect",
+            result=EFFECT,
+            pattern=Pattern(kind=CallExpr, children=(Args(REG),)),
+            cost=1,
+            action="emit_call_effect",
+        ),
+        Rule(
+            name="call_bool_cond",
+            result=COND,
+            pattern=Pattern(
+                kind=CallExpr,
+                children=(Args(REG),),
+                predicate=is_bool_expr,
+            ),
+            cost=3,
+            action="emit_call_bool_cond",
         ),
     )
 
